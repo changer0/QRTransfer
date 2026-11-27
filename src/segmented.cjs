@@ -25,6 +25,39 @@ function unpackBlock(bytes,size){
   return Buffer.from(inflateSync(bytes.subarray(1),{out:new Uint8Array(size+1)}));
 }
 const wrap=(id,i,p)=>('QRT2:'+id+':'+i+':'+p).toUpperCase();
+const REPAIR_BATCH=12;
+function ranges(numbers){
+  const out=[];
+  for(let i=0;i<numbers.length;){
+    const first=numbers[i];let last=first;
+    while(++i<numbers.length&&numbers[i]===last+1)last=numbers[i];
+    out.push(first===last?String(first):first+'-'+last);
+  }
+  return out.join(',');
+}
+function parseRepair(code,session,total){
+  const m=/^QRF1:([0-9a-f]{8}|[0-9a-f]{24}):(.+)$/i.exec(String(code).trim().replace(/\s/g,''));
+  if(!m||m[2].length>4096)throw Error('补帧码格式无效');
+  if(!session.startsWith(m[1].toLowerCase()))throw Error('补帧码与当前文件会话不匹配');
+  const entries=m[2].split(';');
+  if(entries.length>REPAIR_BATCH)throw Error('每次最多补传 '+REPAIR_BATCH+' 个分块，请分批操作');
+  const result=new Map();
+  for(const item of entries){
+    const entry=/^([1-9]\d{0,15})\/(\*|[1-9]\d{0,2}(?:-[1-9]\d{0,2})?(?:,[1-9]\d{0,2}(?:-[1-9]\d{0,2})?)*)$/.exec(item);
+    if(!entry)throw Error('补帧码格式无效');
+    const block=Number(entry[1]);
+    if(!Number.isSafeInteger(block)||block>total||result.has(block))throw Error('分块编号无效或重复');
+    if(entry[2]==='*'){result.set(block,null);continue}
+    const frames=new Set();
+    for(const part of entry[2].split(',')){
+      const [a,b=a]=part.split('-').map(Number);
+      if(a>b||b>100)throw Error('补帧码格式或帧编号无效');
+      for(let n=a;n<=b;n++)frames.add(n);
+    }
+    result.set(block,frames);
+  }
+  return result;
+}
 async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
   const fragment=options.fragment||FRAGMENT;
   if(!Number.isInteger(fragment)||fragment<350||fragment>1450)throw Error('二维码密度无效');
@@ -43,7 +76,24 @@ async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
     const enc=encoder(manifest);
     return Array.from({length:enc.fragmentsLength===1?1:enc.fragmentsLength+2},()=>wrap(id,0,enc.nextPart()));
   }
-  return {session:id,meta,get cycle(){return cycle+1},get block(){return Math.min(index,countFor(meta.size))},async next(){
+  async function createRepair(code){
+    const plan=parseRepair(code,id,countFor(meta.size)),frames=[];
+    for(const [block,wanted] of plan){
+      const offset=(block-1)*BLOCK_BYTES;
+      const raw=Buffer.from(await blob.slice(offset,offset+BLOCK_BYTES).arrayBuffer());
+      const enc=encoder(options.compress?packBlock(raw):raw,fragment);
+      const count=enc.fragmentsLength;
+      if(wanted&&[...wanted].some(n=>n>count))throw Error('分块 '+block+' 的帧编号越界');
+      for(let n=1;n<=count;n++){
+        const frame=enc.nextPart();
+        if(!wanted||wanted.has(n))frames.push(wrap(id,block,frame));
+      }
+    }
+    if(!frames.length)throw Error('没有需要补传的帧');
+    let position=0;
+    return {count:frames.length,blocks:plan.size,get position(){return position%frames.length},next(){return frames[position++%frames.length]}};
+  }
+  return {session:id,meta,createRepair,get cycle(){return cycle+1},get block(){return Math.min(index,countFor(meta.size))},async next(){
     if(manifestQueue.length)return manifestQueue.shift();
     if(!current){
       manifestQueue=manifestFrames();
@@ -68,10 +118,39 @@ async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
 }
 class SegmentReceiver{
   constructor(){this.reset()}
-  reset(){this.session=null;this.meta=null;this.manifest=new URDecoder();this.blocks=new Map();this.seen=new Map();this.parts=new Map();this.partial=new Map();this.recoveredBytes=0;this.result=null;this.error=null;this.frames=0;this.legacy=null}
+  reset(){this.session=null;this.meta=null;this.manifest=new URDecoder();this.blocks=new Map();this.seen=new Map();this.parts=new Map();this.partial=new Map();this.recoveredBytes=0;this.result=null;this.error=null;this.frames=0;this.legacy=null;this.lastBlock=0}
   get totalBytes(){return this.meta?.size??this.result?.size??null}
   get completedBlocks(){return this.parts.size}
   get totalBlocks(){return this.meta?countFor(this.meta.size):null}
+  blockStatus(block){
+    if(!this.meta||!Number.isSafeInteger(block)||block<1||block>this.totalBlocks)return {state:'invalid'};
+    if(this.parts.has(block))return {state:'complete',missing:[]};
+    const decoder=this.blocks.get(block);
+    if(!decoder||!decoder.expectedPartCount())return {state:'unseen',missing:null};
+    const count=decoder.expectedPartCount(), recovered=new Set(decoder.receivedPartIndexes().map(i=>i+1)),direct=this.seen.get(block);
+    const frames=Array.from({length:count},(_,i)=>direct.has(String(i+1))?'direct':recovered.has(i+1)?'recovered':'missing');
+    return {state:'partial',count,frames,missing:frames.flatMap((state,i)=>state==='missing'?[i+1]:[])};
+  }
+  repairPlan(onlyBlock){
+    if(!this.meta||this.error||this.result)return null;
+    const entries=[];
+    const add=i=>{
+      const state=this.blockStatus(i);
+      if(state.state==='unseen')entries.push([i,'*']);
+      else if(state.state==='partial'&&state.missing.length)entries.push([i,ranges(state.missing)]);
+    };
+    if(onlyBlock!=null)add(onlyBlock);
+    else{
+      for(const i of this.blocks.keys()){
+        add(i);if(entries.length>=REPAIR_BATCH)break;
+      }
+      for(let i=1;i<=this.totalBlocks&&entries.length<REPAIR_BATCH;i++){
+        if(!this.parts.has(i)&&!this.blocks.has(i))add(i);
+      }
+    }
+    if(!entries.length)return null;
+    return {code:'QRF1:'+this.session.slice(0,8).toUpperCase()+':'+entries.map(([i,missing])=>i+'/'+missing).join(';'),entries};
+  }
   progress(){return this.result?1:this.legacy?this.legacy.progress():this.totalBytes?Math.min(.999,this.recoveredBytes/this.totalBytes):0}
   fail(e){this.error=e.message||String(e);return 'error'}
   finish(){
@@ -127,6 +206,7 @@ class SegmentReceiver{
     try{
       if(!decoder.receivePart(ur))return 'ignored';
       seen.add(seq);
+      this.lastBlock=i;
       this.frames++;
       const size=blockSize(this.meta,i);
       const old=this.partial.get(i)||0;
