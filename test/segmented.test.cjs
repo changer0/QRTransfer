@@ -1,7 +1,7 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
 const {randomBytes}=require('node:crypto');
-const {createSender,SegmentReceiver,RateMeter,BLOCK_BYTES}=require('../src/segmented.cjs');
+const {createSender,SegmentReceiver,RateMeter,BLOCK_BYTES,PROFILES}=require('../src/segmented.cjs');
 async function transfer(bytes,drop=()=>false){
   const s=await createSender(new Blob([bytes]),'中文.bin','file'),r=new SegmentReceiver();
   let previous=0;
@@ -63,4 +63,29 @@ test('兼容旧发送端，隔离其他会话',async()=>{
   const a=await createSender(new Blob(['a']),'a'),b=await createSender(new Blob(['b']),'b');
   r.receive(await a.next());assert.equal(r.receive(await b.next()),'other');
   r.receive(await a.next());assert.deepEqual(Buffer.concat(r.result.parts),Buffer.from('a'));
+});
+test('高速各档位、压缩与不可压缩数据、丢帧和完整性',async()=>{
+  const data=Buffer.concat([Buffer.from('二维码日志 hello world\n'.repeat(2000)),randomBytes(40000)]);
+  for(const profile of Object.values(PROFILES)){
+    const s=await createSender(new Blob([data]),'mix.bin','file',()=>{},{fragment:profile.fragment,compress:true});
+    const r=new SegmentReceiver();
+    for(let i=0;i<5000&&!r.result&&!r.error;i++){
+      const f=await s.next();
+      if(i%5===2)continue;
+      r.receive(f);const before=r.recoveredBytes;r.receive(f);assert.equal(r.recoveredBytes,before);
+    }
+    assert.ok(r.result,r.error||profile.label);
+    assert.deepEqual(Buffer.concat(r.result.parts),data);
+  }
+});
+test('高密度二维码像素解码，实际载荷恢复',async()=>{
+  const QR=require('qrcode'),jsQR=require('jsqr'),{PNG}=require('pngjs');
+  const data=randomBytes(8000),s=await createSender(new Blob([data]),'data.bin','file',()=>{},{fragment:1450,compress:true}),r=new SegmentReceiver();
+  for(let i=0;i<60&&!r.result;i++){
+    const frame=await s.next();
+    const img=PNG.sync.read(await QR.toBuffer([{data:frame,mode:'alphanumeric'}],{scale:6,errorCorrectionLevel:'M',margin:4}));
+    const decoded=jsQR(new Uint8ClampedArray(img.data),img.width,img.height);
+    assert.equal(decoded.data,frame);r.receive(decoded.data);
+  }
+  assert.ok(r.result,r.error);assert.deepEqual(Buffer.concat(r.result.parts),data);
 });
