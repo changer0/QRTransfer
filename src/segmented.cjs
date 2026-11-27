@@ -9,6 +9,7 @@ const countFor=size=>Math.ceil(size/BLOCK_BYTES);
 const blockSize=(meta,i)=>Math.min(BLOCK_BYTES,meta.size-(i-1)*BLOCK_BYTES);
 const encoder=(bytes,fragment=FRAGMENT,seq=0)=>new UREncoder(UR.fromBuffer(bytes),fragment,seq);
 const PROFILES={
+  slow:{fragment:350,fps:2,label:'超稳'},
   stable:{fragment:450,fps:6,label:'兼容'},
   balanced:{fragment:850,fps:12,label:'均衡'},
   fast:{fragment:1200,fps:18,label:'高速'},
@@ -26,7 +27,7 @@ function unpackBlock(bytes,size){
 const wrap=(id,i,p)=>('QRT2:'+id+':'+i+':'+p).toUpperCase();
 async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
   const fragment=options.fragment||FRAGMENT;
-  if(!Number.isInteger(fragment)||fragment<FRAGMENT||fragment>1450)throw Error('二维码密度无效');
+  if(!Number.isInteger(fragment)||fragment<350||fragment>1450)throw Error('二维码密度无效');
   if(!Number.isSafeInteger(blob.size)||blob.size<0||!['file','text'].includes(kind))throw Error('文件或类型无效');
   const digest=SHA('sha256');
   for(let pos=0;pos<blob.size;pos+=HASH_CHUNK){
