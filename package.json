@@ -1,0 +1,1 @@
+{"name":"qrtransfer","version":"0.1.0","private":true,"scripts":{"test":"node --test","build":"node scripts/build.cjs"},"dependencies":{"@ngraveio/bc-ur":"1.1.13","qrcode":"1.5.4","jsqr":"1.4.0","sha.js":"2.4.12","buffer":"6.0.3"},"devDependencies":{"browserify":"17.0.1"}}
