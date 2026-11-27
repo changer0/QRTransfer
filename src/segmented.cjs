@@ -71,7 +71,7 @@ async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
   if(options.compress)meta.codec='deflate-block-v1';
   if(fragment!==FRAGMENT)meta.fragment=fragment;
   const manifest=Buffer.from(JSON.stringify(meta),'utf8'), id=hash(manifest).slice(0,24);
-  let index=1,cycle=0,manifestQueue=[],current=null,sent=0,parity=null,limit=0;
+  let index=1,cycle=0,manifestQueue=[],current=null,sent=0,parity=null,limit=0,roundSignals=0;
   function manifestFrames(){
     const enc=encoder(manifest);
     return Array.from({length:enc.fragmentsLength===1?1:enc.fragmentsLength+2},()=>wrap(id,0,enc.nextPart()));
@@ -93,7 +93,8 @@ async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
     let position=0;
     return {count:frames.length,blocks:plan.size,get position(){return position%frames.length},next(){return frames[position++%frames.length]}};
   }
-  return {session:id,meta,createRepair,get cycle(){return cycle+1},get block(){return Math.min(index,countFor(meta.size))},async next(){
+  return {session:id,meta,createRepair,get cycle(){return cycle+1},get block(){return Math.min(index,countFor(meta.size))},get firstProgress(){return !meta.size||cycle>0?1:Math.min(1,((index-1)+(current&&limit?sent/limit:0))/countFor(meta.size))},async next(){
+    if(roundSignals){roundSignals--;return 'QRT2END:'+id.toUpperCase()+':'+cycle}
     if(manifestQueue.length)return manifestQueue.shift();
     if(!current){
       manifestQueue=manifestFrames();
@@ -111,14 +112,14 @@ async function createSender(blob,name,kind='file',onHash=()=>{},options={}){
     const frame=wrap(id,index,(sent<current.fragmentsLength?current:parity).nextPart());
     if(++sent>=limit){
       current=null;parity=null;
-      if(++index>countFor(meta.size)){index=1;cycle++}
+      if(++index>countFor(meta.size)){index=1;cycle++;if(options.roundSignals)roundSignals=3}
     }else if(sent%16===0)manifestQueue=manifestFrames();
     return frame;
   }};
 }
 class SegmentReceiver{
   constructor(){this.reset()}
-  reset(){this.session=null;this.meta=null;this.manifest=new URDecoder();this.blocks=new Map();this.seen=new Map();this.parts=new Map();this.partial=new Map();this.recoveredBytes=0;this.result=null;this.error=null;this.frames=0;this.legacy=null;this.lastBlock=0}
+  reset(){this.session=null;this.meta=null;this.manifest=new URDecoder();this.blocks=new Map();this.seen=new Map();this.parts=new Map();this.partial=new Map();this.recoveredBytes=0;this.result=null;this.error=null;this.frames=0;this.legacy=null;this.lastBlock=0;this.round=0}
   get totalBytes(){return this.meta?.size??this.result?.size??null}
   get completedBlocks(){return this.parts.size}
   get totalBlocks(){return this.meta?countFor(this.meta.size):null}
@@ -152,6 +153,15 @@ class SegmentReceiver{
     return {code:'QRF1:'+this.session.slice(0,8).toUpperCase()+':'+entries.map(([i,missing])=>i+'/'+missing).join(';'),entries};
   }
   progress(){return this.result?1:this.legacy?this.legacy.progress():this.totalBytes?Math.min(.999,this.recoveredBytes/this.totalBytes):0}
+  restoreBlock(i,data){
+    if(!this.meta||this.parts.has(i)||!Number.isSafeInteger(i)||i<1||i>this.totalBlocks)throw Error('缓存分块无效');
+    const bytes=Buffer.from(data);
+    if(bytes.length!==blockSize(this.meta,i))throw Error('缓存分块长度错误');
+    this.parts.set(i,bytes);this.recoveredBytes+=bytes.length-(this.partial.get(i)||0);
+    this.partial.delete(i);this.blocks.delete(i);this.seen.delete(i);this.lastBlock=i;
+    if(this.parts.size===this.totalBlocks)return this.finish();
+    return 'accepted';
+  }
   fail(e){this.error=e.message||String(e);return 'error'}
   finish(){
     const digest=SHA('sha256'),parts=[];
@@ -165,6 +175,12 @@ class SegmentReceiver{
   receive(frame){
     if(this.result||this.error)return 'finished';
     if(typeof frame!=='string'||frame.length>3500)return 'invalid';
+    const end=/^QRT2END:([0-9A-F]{24}):([1-9]\d{0,9})$/i.exec(frame);
+    if(end){
+      if(!this.meta||end[1].toLowerCase()!==this.session)return 'ignored';
+      if(+end[2]<=this.round)return 'ignored';
+      this.round=+end[2];return 'round';
+    }
     if(/^QRT1:/i.test(frame)){
       if(this.session)return 'other';
       if(!this.legacy)this.legacy=new LegacyReceiver();
